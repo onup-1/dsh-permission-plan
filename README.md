@@ -108,6 +108,9 @@ plugin_manager remove_bundle  target=dsh-permission-plan
 - 计划跨区也安全：`permission_plan` 会**逐条**判断每个操作项属于哪个区，分别记进各自词表（例如「构建模组 + push 到 GitHub」会同时写进 `mod` 和 `github`）。
 - 删除/终止类操作在任何区都不会自动放行；`plugin_manager` 同样永不自动放行。
 - 关掉 mod 兜底：设 `DSH_PERMISSION_PLAN_MOD_FALLBACK=0`。
+- **mod 区词表单向同步**：每次判断前（15 秒节流 + 文件 mtime 检查）读一次 `profiles/<profile>/node_modules/dsh-mod-build-auto-approve/learned.json`，把 `dsh-mod-build-auto-approve` 新学到的词复制进 `mod` 区（来源标记 `mod-plugin`），它的 `promoted` 弱词也一起带过来。所以那两个插件各管各的词表，但 mod 区的词不会落后。换路径用 `DSH_PERMISSION_PLAN_MOD_STORE`。
+- 同一个词如果已经记在 `other` 区，就不再重复导入 `mod` 区（`other` 的词本来就对所有区生效），避免一条词在两个区各存一份。
+- 历史遗留：分区出现之前学到的模组味词（`构件`、`userdev`、`jar`、`复验构建` 等）会被自动迁移进 `mod` 区，**不删除**，只是换到它该在的区。
 
 加一个新区只要三步：在 `ZONES` 里加一项（`id` / `label` / `pattern` / 可选 `delegate`），决定是否委托给别的插件，再在 README 这张表补一行——`classify()`、词表过滤、`permission_check` 输出、`permission_keywords` 统计都会自动带上它。
 
@@ -122,20 +125,21 @@ plugin_manager remove_bundle  target=dsh-permission-plan
 | 词表文件 | `C:\Users\rog\Documents\deepseek-harness\default-workspace\dsh-mod-approve\learned.json` | `C:\Users\rog\Documents\deepseek-harness\default-workspace\plugins\dsh-permission-plan\learned.json` |
 | 批量申请工具 | `mod_permission_plan`（模组场景专用文案） | `permission_plan`（通用） |
 
-两者互不读写对方的 `learned.json`，删掉任一个都不影响另一个。
+`dsh-mod-build-auto-approve` 的定位是「只想让模组相关一路畅通」的人：它只管模组那摊事，别的权限一概不自动放行。本插件是总框架，模组那摊事在 `mod` 区里，装了旧插件就委托给它、没装就自己接管。
 
 ### 同时启用时的行为
 
 - 同一个 `approval/request` 会先过两道钩子：谁先命中自己的词表谁就返回 `allowed-once`，另一个继续 `next()`，最后才轮到人工审批。
 - **不会弹两次窗**：命中即返回，没命中的那个根本不会问人。
-- **硬边界（代码保证）**：理由里出现 `fabric|loom|forge|gradle|minecraft|mixin|mcp|yarn|daynight|bmclapi|runserver|runclient|模组` 之一的请求，本插件**一律不自动放行**，交给 mod 插件判断；这些词也不会被本插件学进词表。
-- **mod 插件不在时自动兜底**：如果 `dsh-mod-build-auto-approve` 被卸载或被 `plugin_manager` 禁用，上面的硬边界自动失效，模组域请求改由本插件按自己的关键词判断（否则你会退回逐条点批准）。检测方式是读 profile 的 `package.json`（`dsh.profile.bundles`）与 `cordis.patch.yml`（`- id: mod-build-auto-approve` 下的 `disabled` 标志），结果缓存 15 秒；`permission_check` 会打印「mod 插件检测：启用/未启用 · <profile 目录>」方便核对。
+- **硬边界（代码保证）**：分区判定为 `mod` 的请求，本插件**一律不自动放行**，交给 mod 插件判断；这种判定在 `remember()` 里也拦着，通用区学不到模组词。
+- **mod 区词表跟得上**：旧插件的 `learned.json` 会被单向读进来（见上面「分区」一节的同步规则），所以你在旧插件那边新批下来的模组词，这边 `mod` 区立刻就有——不需要手工抄。
+- **mod 插件不在时自动兜底**：如果 `dsh-mod-build-auto-approve` 被卸载或被 `plugin_manager` 禁用，委托自动失效，模组域请求改由本插件按 `mod` 区词表判断（否则你会退回逐条点批准）。检测方式是读 profile 的 `package.json`（`dsh.profile.bundles`）与 `cordis.patch.yml`（`- id: mod-build-auto-approve` 下的 `disabled` 标志），结果缓存 15 秒；`permission_check` 会打印「mod 插件检测：启用/未启用 · <profile 目录>」方便核对。
 - 想强制关掉兜底（无论 mod 插件是否在，都不接管模组域）：设环境变量 `DSH_PERMISSION_PLAN_MOD_FALLBACK=0`。
 - `配置` / `config` / `setup` / `设置` 是弱词：单条命中只提示、不自动放行，避免「一句配置」把模组环境配置顺手批了。
 
-### 想把边界划得更死？
+### 为什么要分成两套词表
 
-在模组构建的会话里，让模型先用 `mod_permission_plan` 批一次（模组词表命中），之后模组命令走旧插件；通用任务用 `permission_plan`。两套词表各记各的，长期会自然分岔。
+旧插件不要动：它的用户只想要模组放行，多给别的权限等于替他们做主。本插件也不该把模组词塞进 `other` 区——`other` 区的词对所有区生效，一个 `jar` 放在那儿就等于给 GitHub 区也开了口子。所以：模组词归 `mod` 区（并可单向继承旧插件的词表），通用词归 `other` 区，GitHub 词归 `github` 区。
 
 ## License
 

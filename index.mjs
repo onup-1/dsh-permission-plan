@@ -17,7 +17,7 @@
  * keyword must not be able to delete something or install a bundle.
  */
 
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -158,8 +158,103 @@ function modOwnerActive() {
   return active
 }
 
-/** Cluster rules: label, matcher and the words worth remembering when the cluster is approved. */
-const CLUSTERS = [
+/**
+ * Words the mod plugin learned are this framework's mod-zone vocabulary, so the two tables stay
+ * in step without merging them: dsh-mod-build-auto-approve keeps serving people who only want
+ * mod work to flow, and its newest words flow into the mod zone here.
+ */
+const MOD_LEGACY_WORDS = new Set([
+  '复验构建', '构件', 'userdev', 'jar', 'gradle', 'gradlew', 'forge', 'fabric', 'loom', 'mixin',
+  'mcp', 'yarn', 'minecraft', 'mod', 'mods', 'modloader', 'runserver', 'runclient', '模组'
+])
+const MOD_SYNC_MS = 15000
+let modSyncState = { at: 0, file: '', mtimeMs: -1 }
+
+function modStoreFile() {
+  const override = process.env.DSH_PERMISSION_PLAN_MOD_STORE
+  if (typeof override === 'string' && override.trim() !== '') return override.trim()
+  const profile = process.env.DSH_PROFILE || 'desktop'
+  const homes = [process.env.DSH_HOME, join(process.env.USERPROFILE || process.cwd(), '.dsh'), join(process.env.APPDATA || process.cwd(), 'dsh')]
+  for (const home of homes) {
+    if (!home) continue
+    const file = join(home, 'profiles', profile, 'node_modules', MOD_PLUGIN_PACKAGE, 'learned.json')
+    try {
+      if (statSync(file).isFile()) return file
+    } catch {
+      continue
+    }
+  }
+  return undefined
+}
+
+function syncModZone(store) {
+  const now = Date.now()
+  if (now - modSyncState.at < MOD_SYNC_MS) return 0
+  modSyncState.at = now
+  const file = modStoreFile()
+  if (file === undefined) return 0
+  let mtimeMs = 0
+  try {
+    mtimeMs = statSync(file).mtimeMs
+  } catch {
+    return 0
+  }
+  if (file === modSyncState.file && mtimeMs === modSyncState.mtimeMs) return 0
+  modSyncState.file = file
+  modSyncState.mtimeMs = mtimeMs
+  const source = readJson(file, undefined)
+  if (source === null || typeof source !== 'object') return 0
+  const known = new Set(store.keywords.map((entry) => `${entry.zone ?? 'other'}:${entry.word.toLowerCase()}`))
+  // A word already filed under `other` speaks for every zone, so copying it into `mod` would only
+  // duplicate it; keep the single `other` copy instead.
+  const inOther = new Set(store.keywords.filter((entry) => (entry.zone ?? 'other') === 'other').map((entry) => entry.word.toLowerCase()))
+  let added = 0
+  for (const entry of Array.isArray(source.keywords) ? source.keywords : []) {
+    // The mod plugin stores bare strings; tolerate that and our own { word, ... } shape.
+    const record = entry !== null && typeof entry === 'object' ? entry : undefined
+    const word = typeof entry === 'string' ? entry.trim() : (typeof record?.word === 'string' ? record.word.trim() : '')
+    if (word.length < 2) continue
+    if (inOther.has(word.toLowerCase())) continue
+    const key = `mod:${word.toLowerCase()}`
+    if (known.has(key)) continue
+    store.keywords.push({
+      word,
+      zone: 'mod',
+      at: Number.isFinite(record?.at) ? record.at : Date.now(),
+      uses: Number.isFinite(record?.uses) ? record.uses : 0,
+      source: 'mod-plugin'
+    })
+    known.add(key)
+    added += 1
+  }
+  if (Array.isArray(source.promoted)) {
+    for (const word of source.promoted) {
+      if (typeof word !== 'string' || word.trim() === '') continue
+      if (store.promoted.some((item) => item.toLowerCase() === word.toLowerCase())) continue
+      store.promoted.push(word.trim())
+    }
+  }
+  const before = store.keywords.length
+  store.keywords = store.keywords.filter((entry) => !((entry.zone ?? 'other') === 'mod' && inOther.has(entry.word.toLowerCase())))
+  const pruned = before - store.keywords.length
+  if (added > 0 || pruned > 0) saveStore(store)
+  return added
+}
+
+/** One-time tidy-up: mod-flavoured words learned before the zones existed move into the mod zone. */
+function migrateLegacyModWords(store) {
+  let moved = 0
+  for (const entry of store.keywords) {
+    if ((entry.zone ?? 'other') === 'mod') continue
+    if (!MOD_LEGACY_WORDS.has(String(entry.word).toLowerCase())) continue
+    entry.zone = 'mod'
+    moved += 1
+  }
+  if (moved > 0) saveStore(store)
+  return moved
+}
+
+/** Cluster rules: label, matcher and the words worth remembering when the cluster is approved. */const CLUSTERS = [
   { id: 'fs-write', label: '写入工作区之外的文件', re: /(\bwrite\b|\bsave\b|\bcopy\b|\bmove\b|\brename\b|\bmkdir\b|写入|写入到|保存|复制|移动|重命名|新建目录|覆盖)/i },
   { id: 'process', label: '启动/结束本地进程', re: /(\bstart\b|\bspawn\b|\bnpm\b|\bpnpm\b|\bpip\b|\bgradle\b|\bmvn\b|\bjava\b|\bnode\b|\bpython\b|\bcsc\b|启动|运行|执行|编译|构建)/i },
   { id: 'network', label: '访问网络/下载依赖', re: /(\bdownload\b|\bwget\b|\bcurl\b|\bhttp\b|\bhttps\b|\bgit\s+(?:clone|push|pull|fetch|ls-remote|remote)\b|\bgit-ssl\b|\bgithub\b|\bgist\b|下载|拉取|推送|镜像|接口)/i },
@@ -406,7 +501,12 @@ function bump(store, mode) {
 }
 
 export function apply(ctx) {
-  const current = () => loadStore()
+  const current = () => {
+    const store = loadStore()
+    migrateLegacyModWords(store)
+    syncModZone(store)
+    return store
+  }
 
   // ---------------------------------------------------------------- feature 2: keywords
   ctx.on(
