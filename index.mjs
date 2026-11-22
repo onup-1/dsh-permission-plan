@@ -268,7 +268,41 @@ function migrateLegacyModWords(store) {
   return moved
 }
 
-/** Cluster rules: label, matcher and the words worth remembering when the cluster is approved. */const CLUSTERS = [
+/** The tool a cluster would plausibly escalate through; only used as the approval card's subject. */
+const APPROVAL_TOOL_BY_CLUSTER = {
+  'fs-write': 'write',
+  process: 'pwsh',
+  network: 'pwsh',
+  install: 'pwsh',
+  system: 'pwsh',
+  elevate: 'pwsh',
+  destructive: 'pwsh'
+}
+
+/**
+ * Raise the host's own approval card for one permission instead of a batch dialog.
+ * Returns undefined when the host has no approval service, so the caller can fall back.
+ */
+async function requestNativeApproval(ctx, agent, cluster, item, detailLines) {
+  if (agent === undefined) return undefined
+  const approval = typeof ctx.get === 'function' ? ctx.get('approval') : undefined
+  if (approval === undefined || typeof approval.request !== 'function') return undefined
+  const reason = [item, ...detailLines].filter((line) => typeof line === 'string' && line !== '').join('\n')
+  try {
+    const outcome = await approval.request({
+      agent,
+      toolName: APPROVAL_TOOL_BY_CLUSTER[cluster] ?? 'pwsh',
+      reason,
+      permissionPlanSynthetic: true
+    })
+    return typeof outcome === 'string' ? outcome : 'unavailable'
+  } catch {
+    return undefined
+  }
+}
+
+/** Cluster rules: label, matcher and the words worth remembering when the cluster is approved. */
+const CLUSTERS = [
   { id: 'fs-write', label: '写入工作区之外的文件', re: /(\bwrite\b|\bsave\b|\bcopy\b|\bmove\b|\brename\b|\bmkdir\b|写入|写入到|保存|复制|移动|重命名|新建目录|覆盖)/i },
   { id: 'process', label: '启动/结束本地进程', re: /(\bstart\b|\bspawn\b|\bnpm\b|\bpnpm\b|\bpip\b|\bgradle\b|\bmvn\b|\bjava\b|\bnode\b|\bpython\b|\bcsc\b|启动|运行|执行|编译|构建)/i },
   { id: 'network', label: '访问网络/下载依赖', re: /(\bdownload\b|\bwget\b|\bcurl\b|\bhttp\b|\bhttps\b|\bgit\s+(?:clone|push|pull|fetch|ls-remote|remote)\b|\bgit-ssl\b|\bgithub\b|\bgist\b|下载|拉取|推送|镜像|接口)/i },
@@ -526,6 +560,9 @@ export function apply(ctx) {
   ctx.on(
     'approval/request',
     async (req, next) => {
+      // Our own single-permission asks must reach the human through the native approval card,
+      // not through this gateway (that would answer our own question and skip the card).
+      if (req?.permissionPlanSynthetic === true) return next()
       let store
       try {
         store = current()
@@ -631,6 +668,9 @@ export function apply(ctx) {
         render(_args, value) {
           if (value?.approved === true) {
             const clusters = (value.clusters ?? []).join('、') || '（无）'
+            if ((value.learned ?? []).length === 0) {
+              return [{ type: 'text', text: `已允许这一次：${clusters}。单次授权，没有记住关键词，下次还会再问。` }]
+            }
             return [{ type: 'text', text: `已一次性批准：${clusters}。记住关键词 ${(value.learned ?? []).length} 个，之后同类请求自动放行。` }]
           }
           return [{ type: 'text', text: '未获得批量授权：之后的提权请求仍会逐条询问。' }]
@@ -657,6 +697,25 @@ export function apply(ctx) {
         if (items.length > 0) {
           detailLines.push('本次要做的操作：')
           items.forEach((item, index) => detailLines.push(`  ${index + 1}. ${item}`))
+        }
+
+        // A single permission does not need a batch dialog: raise the host's own approval card
+        // (the one with 允许一次 / 始终允许 / 拒绝) so the human sees one ordinary request.
+        if (items.length <= 1 && clusters.length === 1) {
+          const outcome = await requestNativeApproval(ctx, agent, clusters[0], items[0] ?? task, detailLines)
+          if (outcome !== undefined) {
+            const granted = outcome === 'allowed-once'
+            if (granted) bump(current(), 'human')
+            else bump(current(), 'rejected')
+            recordDecision({
+              at: Date.now(),
+              tool: 'permission_plan',
+              mode: granted ? 'human' : 'rejected',
+              hits: [],
+              reason: blob.slice(0, 160)
+            })
+            return { approved: granted, clusters, learned: [], blocked: granted ? [] : ['单次授权未通过'] }
+          }
         }
         if (clusters.length > 0) {
           detailLines.push(`涉及权限类别：${clusters.map(clusterLabel).join('、')}`)
