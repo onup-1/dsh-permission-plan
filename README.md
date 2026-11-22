@@ -56,6 +56,36 @@ DSH 原生审批卡是**占用输入框那块地方**显示的：卡片挂在 `c
 | 请求管理员权限 | admin / uac / sudo / elevat / 管理员 / 提权 |
 | 删除或终止 | delete / rm / kill / Remove-Item / 删除 / 清空 |
 
+## 提示音与试听
+
+审批卡弹出时会响一声。默认用鲸鲸挂件（`dsh-whale-widget`）自带的 `cost-default.wav`，从这些位置按顺序找：
+
+```
+%DSH_HOME%\profiles\<profile>\node_modules\dsh-whale-widget\assets\cost-default.wav
+%USERPROFILE%\.dsh\profiles\<profile>\node_modules\dsh-whale-widget\assets\cost-default.wav
+%APPDATA%\dsh\profiles\<profile>\node_modules\dsh-whale-widget\assets\cost-default.wav
+```
+
+换声音只需改 `index.mjs` 里的一个常量（`synth` = 浏览器合成音）：
+
+```js
+const CARD_SOUND = 'cost-default.wav'
+```
+
+两个常设页面（都不需要登录 cookie）：
+
+| 地址 | 作用 |
+| --- | --- |
+| `http://127.0.0.1:<web端口>/permission-plan/audio-lab.html` | 把鲸鲸 `assets` 目录里所有音频（含 mp3）逐个列出来试听 |
+| `http://127.0.0.1:<web端口>/permission-plan/probe.html` | 前端自检页：绕过 DSH 模块加载器直接加载 `client.js`，打印按钮真实矩形 |
+| `GET /permission-plan/probe` | 读最近一次前端上报（`boot-start` / `booted` / `boot-error: …`，含 `button`、`modelRow`、`roundButton` 坐标） |
+
+输入框右侧那个「试听」胶囊按钮也在这里：
+
+- 位置 = **与模型名同一行、贴在模型名左边 8px**（`modelAnchorRect()` 取圆形发送键所在行的前一个兄弟节点）；
+- 悬停显示当前音频的「名称 + 完整文件路径」，可复制；
+- 点击播一次（同时解锁浏览器的自动播放限制）。
+
 ## 安全边界（重要）
 
 - **删除/终止类永远单独问。** 只要请求文字里出现 `rm`、`del`、`Remove-Item`、`taskkill`、`删除`、`清空` 等，`permission_plan` 会明确标注「仍需单独批准」，审批钩子也永不放行这一类。
@@ -68,8 +98,8 @@ DSH 原生审批卡是**占用输入框那块地方**显示的：卡片挂在 `c
 
 | 文件 | 作用 |
 | --- | --- |
-| `index.mjs` | 插件实现：审批钩子 + 4 个工具 + 关键词引擎 + 待批队列与两条 HTTP 路由 |
-| `client.js` | 浏览器半边：轮询待批、画浮卡、回传回答（纯 DOM，无 React） |
+| `index.mjs` | 插件实现：审批钩子 + 4 个工具 + 关键词引擎 + 待批队列与 HTTP 路由（待批 / 回答 / 提示音 / 探针 / 试听页） |
+| `client-0.2.1.js` | 浏览器半边：轮询待批、画浮卡、提示音、试听按钮、自检上报（纯 DOM，无 React） |
 | `learned.json` | 运行时生成的记忆（关键词表、批量授权记录、计数）。删掉等于全忘 |
 | `stats.jsonl` | 逐条决策日志（自动/人工/拒绝/批量），超过 10 万条自动裁头 |
 | `cordis.patch.yml` | bundle 注入声明 |

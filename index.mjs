@@ -17,7 +17,7 @@
  * keyword must not be able to delete something or install a bundle.
  */
 
-import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -555,6 +555,8 @@ function bump(store, mode) {
 // /permission-plan/answer, and this hook resolves the approval itself. The composer never moves.
 const PENDING_APPROVALS = new Map()
 let lastClientPollAt = 0
+let lastClientReport = null
+let lastProbeReport = null
 const CLIENT_FRESH_MS = 5000
 const CARD_TIMEOUT_MS = 5 * 60 * 1000
 
@@ -608,6 +610,125 @@ function json(response, status, value) {
   response.end(JSON.stringify(value))
 }
 
+// The whale widget (dsh-whale-widget) ships the chimes this machine already knows. The user asked
+// for the "answer finished" chime (task-end-a.wav) on our card, so that one is the card default; the
+// other two are exposed for the one-shot sound tour (`/permission-plan/sounds`). Everything is served
+// from our own route, so nothing is copied into this package and the widget need not be loaded.
+const SOUND_LIBRARY = [
+  { name: 'task-end-a.wav', label: '回合结束音（回答输出完）' },
+  { name: 'approve-default.wav', label: '授权音（审批弹出）' },
+  { name: 'ask-default.wav', label: '提问音（向你提问）' },
+  { name: 'cost-default.wav', label: '消费提示音（费用变化）' }
+]
+// The card chime. `synth` means the browser generates it (880 Hz → 1174.66 Hz two-note); any name from
+// SOUND_LIBRARY means the whale-widget wav of that name is served for the browser to play.
+const CARD_SOUND = 'cost-default.wav'
+const SOUND_DEMO_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+
+function assetsDir() {
+  const homes = []
+  if (process.env.DSH_HOME) homes.push(process.env.DSH_HOME)
+  const userProfile = process.env.USERPROFILE ?? process.env.HOME
+  if (userProfile) homes.push(join(userProfile, '.dsh'))
+  if (process.env.APPDATA) homes.push(join(process.env.APPDATA, 'dsh'))
+  for (const home of homes) {
+    let profiles
+    try {
+      profiles = readdirSync(join(home, 'profiles'))
+    } catch {
+      continue
+    }
+    for (const profile of profiles) {
+      const dir = join(home, 'profiles', profile, 'node_modules', 'dsh-whale-widget', 'assets')
+      try {
+        if (statSync(dir).isDirectory()) return dir
+      } catch {
+        // next profile
+      }
+    }
+  }
+  return undefined
+}
+
+function soundFile(name) {
+  const dir = assetsDir()
+  if (dir === undefined) return undefined
+  const file = join(dir, name)
+  try {
+    return statSync(file).isFile() ? file : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function assetList() {
+  const dir = assetsDir()
+  if (dir === undefined) return []
+  try {
+    return readdirSync(dir)
+      .filter((name) => /\.(wav|mp3)$/i.test(name))
+      .map((name) => {
+        let bytes = 0
+        try {
+          bytes = statSync(join(dir, name)).size
+        } catch {
+          bytes = 0
+        }
+        return { name, bytes }
+      })
+      .sort((a, b) => b.bytes - a.bytes)
+  } catch {
+    return []
+  }
+}
+
+function soundDescriptor() {
+  if (CARD_SOUND === 'synth') {
+    return {
+      card: CARD_SOUND,
+      kind: 'synth',
+      name: 'synth',
+      label: '合成音（880Hz → 1174.66Hz 两声，浏览器里生成）',
+      file: ''
+    }
+  }
+  const meta = SOUND_LIBRARY.find((sound) => sound.name === CARD_SOUND)
+  return {
+    card: CARD_SOUND,
+    kind: 'wav',
+    name: CARD_SOUND,
+    label: meta?.label ?? CARD_SOUND,
+    file: soundFile(CARD_SOUND) ?? ''
+  }
+}
+function sendSound(response, name) {
+  const requested = String(name ?? '') === '' ? CARD_SOUND : String(name)
+  // The audition lab needs every clip in the widget's assets folder, so any plain audio file name in
+  // that folder is fair game; anything else still has to be one of the known card sounds.
+  const safe = /^[A-Za-z0-9._-]+\.(wav|mp3)$/i.test(requested)
+  const known = SOUND_LIBRARY.some((sound) => sound.name === requested)
+  const file = safe ? soundFile(requested) : known ? soundFile(requested) : undefined
+  if (file === undefined) {
+    response.writeHead(404, { 'cache-control': 'no-store' })
+    response.end()
+    return
+  }
+  let bytes
+  try {
+    bytes = readFileSync(file)
+  } catch {
+    response.writeHead(500, { 'cache-control': 'no-store' })
+    response.end()
+    return
+  }
+  response.writeHead(200, {
+    'content-type': /\.mp3$/i.test(requested) ? 'audio/mpeg' : 'audio/wav',
+    'content-length': String(bytes.length),
+    'cache-control': 'public, max-age=3600'
+  })
+  response.end(bytes)
+}
+
 export function apply(ctx) {
   // ---------------------------------------------------------------- own approval card routes
   // The browser half polls `pending` (which doubles as a heartbeat) and answers with `answer`.
@@ -621,10 +742,160 @@ export function apply(ctx) {
             path: '/permission-plan/pending',
             handler: (request, response) => {
               lastClientPollAt = Date.now()
+              // The browser half may send a one-line self report, which is how the button's real
+              // rectangle can be inspected without a devtools console.
+              try {
+                const report = new URL(request.url ?? '/', 'http://localhost').searchParams.get('diag')
+                lastClientReport = typeof report === 'string' && report !== '' ? JSON.parse(report) : lastClientReport
+              } catch {
+                // A malformed report is never fatal: the poll still answers.
+              }
               json(response, 200, { ok: true, pending: pendingList() })
             }
           }),
         'permission-plan: pending'
+      )
+      ctx.effect?.(
+        () =>
+          web.register({
+            kind: 'exact',
+            path: '/permission-plan/sound.wav',
+            handler: (request, response) => {
+              let name = ''
+              try {
+                name = new URL(request.url ?? '/', 'http://localhost').searchParams.get('name') ?? ''
+              } catch {
+                name = ''
+              }
+              sendSound(response, name)
+            }
+          }),
+        'permission-plan: sound'
+      )
+      ctx.effect?.(
+        () =>
+          web.register({
+            kind: 'exact',
+            path: '/permission-plan/sounds',
+            handler: (request, response) => {
+              json(response, 200, {
+                ok: true,
+                demoId: SOUND_DEMO_ID,
+                ...soundDescriptor(),
+                // Tells the browser half whether the page is talking to this host at all: null means
+                // no page has polled since the plugin loaded.
+                clientPollAgoMs: lastClientPollAt === 0 ? null : Date.now() - lastClientPollAt,
+                clientReport: lastClientReport,
+                sounds: SOUND_LIBRARY.filter((sound) => soundFile(sound.name) !== undefined)
+              })
+            }
+          }),
+        'permission-plan: sounds'
+      )
+      // First-run probe channel: any page that loads the browser half reports what it actually
+      // built, so a missing button can be diagnosed without a devtools console.
+      ctx.effect?.(
+        () =>
+          web.register({
+            kind: 'exact',
+            path: '/permission-plan/probe',
+            handler: async (request, response) => {
+              if (request.method === 'POST') {
+                try {
+                  const body = JSON.parse((await readBody(request)) || '{}')
+                  lastProbeReport = { at: Date.now(), page: body }
+                } catch {
+                  lastProbeReport = { at: Date.now(), page: { error: 'unparsable body' } }
+                }
+                json(response, 200, { ok: true })
+                return
+              }
+              json(response, 200, { ok: true, report: lastProbeReport, clientPollAgoMs: lastClientPollAt === 0 ? null : Date.now() - lastClientPollAt })
+            }
+          }),
+        'permission-plan: probe'
+      )
+      // Standalone probe page: opens the plugin's own browser half on a blank document, which is the
+      // fastest way to tell "bundle never ran" from "bundle ran and the button is off screen".
+      ctx.effect?.(
+        () =>
+          web.register({
+            kind: 'exact',
+            path: '/permission-plan/client.js',
+            handler: async (request, response) => {
+              try {
+                const source = readFileSync(new URL('./client-0.2.1.js', import.meta.url), 'utf8')
+                response.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store' })
+                response.end(source)
+              } catch (error) {
+                json(response, 404, { ok: false, error: String(error) })
+              }
+            }
+          }),
+        'permission-plan: client bundle'
+      )
+      ctx.effect?.(
+        () =>
+          web.register({
+            kind: 'exact',
+            path: '/permission-plan/probe.html',
+            handler: (request, response) => {
+              response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+              response.end(`<!doctype html><meta charset="utf-8"><title>permission-plan probe</title>
+<body style="background:#161616;color:#eee;font:14px/1.6 system-ui;padding:24px">
+<h2>dsh-permission-plan 探针</h2>
+<p id="status">正在加载浏览器端脚本…</p>
+<pre id="out" style="white-space:pre-wrap"></pre>
+<script src="/permission-plan/client.js?probe=1"></script>
+<script>
+const out = document.getElementById('out')
+const status = document.getElementById('status')
+function snapshot(stage) {
+  const button = document.getElementById('permission-plan-sound-btn')
+  const rect = button && button.getBoundingClientRect()
+  return {
+    stage, href: location.href,
+    hasBundleGlobal: typeof window !== 'undefined',
+    button: button ? {
+      top: Math.round(rect.top), left: Math.round(rect.left),
+      width: Math.round(rect.width), height: Math.round(rect.height),
+      display: getComputedStyle(button).display, text: button.textContent
+    } : null,
+    viewport: { w: innerWidth, h: innerHeight }
+  }
+}
+setTimeout(() => {
+  const report = snapshot('probe-page')
+  out.textContent = JSON.stringify(report, null, 2)
+  status.textContent = report.button ? '浏览器端脚本已执行，按钮已创建。' : '脚本执行了，但没有创建按钮。'
+  fetch('/permission-plan/probe', { method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify(report) }).catch(() => {})
+}, 1200)
+</script>`)
+            }
+          }),
+        'permission-plan: probe page'
+      )
+      // Audition page: every clip in the whale widget's assets folder, one play button each, so a
+      // sound can be identified by ear instead of by file name guesswork.
+      ctx.effect?.(
+        () =>
+          web.register({
+            kind: 'exact',
+            path: '/permission-plan/audio-lab.html',
+            handler: (request, response) => {
+              const rows = assetList()
+                .map((clip) => `<tr><td style="padding:6px 10px;white-space:nowrap">${clip.name}</td><td style="padding:6px 10px;color:#888">${Math.round(clip.bytes / 1024)} KB</td><td style="padding:6px 10px"><audio controls preload="none" style="height:30px" src="/permission-plan/sound.wav?name=${encodeURIComponent(clip.name)}"></audio></td></tr>`)
+                .join('')
+              response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+              response.end(`<!doctype html><meta charset="utf-8"><title>音频试听</title>
+<body style="background:#161616;color:#e8e8e8;font:14px/1.6 system-ui;padding:24px">
+<h2 style="margin:0 0 6px">鲸鲸音频试听</h2>
+<p style="color:#999;margin:0 0 18px">当前浮卡提示音：<b style="color:#f0a23a">${CARD_SOUND}</b> · 每行点播放，认准哪个是「输出完成」的那声，然后把文件名告诉我。</p>
+<table style="border-collapse:collapse;background:#1d1d1d;border:1px solid #333;border-radius:8px">${rows}</table>
+<p style="color:#666;margin-top:16px">文件目录：${assetsDir() ?? '(未找到)'}</p>`)
+            }
+          }),
+        'permission-plan: audio lab'
       )
       ctx.effect?.(
         () =>
