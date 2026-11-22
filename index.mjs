@@ -548,7 +548,113 @@ function bump(store, mode) {
   store.stats.lastAt = Date.now()
 }
 
+// ---------------------------------------------------------------- own approval card
+// DSH answers a pending approval by taking over the composer seat, which hides the input box.
+// So for requests this plugin could not auto-approve, the plugin asks the human with its own
+// floating card instead: the browser half polls /permission-plan/pending and answers through
+// /permission-plan/answer, and this hook resolves the approval itself. The composer never moves.
+const PENDING_APPROVALS = new Map()
+let lastClientPollAt = 0
+const CLIENT_FRESH_MS = 5000
+const CARD_TIMEOUT_MS = 5 * 60 * 1000
+
+function pendingList() {
+  return [...PENDING_APPROVALS.values()].map((entry) => ({
+    id: entry.id,
+    tool: entry.tool,
+    reason: entry.reason,
+    createdAt: entry.createdAt
+  }))
+}
+
+function answerPending(id, allow) {
+  const entry = PENDING_APPROVALS.get(id)
+  if (entry === undefined) return false
+  PENDING_APPROVALS.delete(id)
+  entry.resolve(allow === true ? 'allowed-once' : 'rejected')
+  return true
+}
+
+function askWithOwnCard(entry) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      if (PENDING_APPROVALS.delete(entry.id)) resolve('timeout')
+    }, CARD_TIMEOUT_MS)
+    timer.unref?.()
+    PENDING_APPROVALS.set(entry.id, {
+      ...entry,
+      resolve: (outcome) => {
+        clearTimeout(timer)
+        resolve(outcome)
+      }
+    })
+  })
+}
+
+function readBody(request) {
+  return new Promise((resolve) => {
+    let raw = ''
+    request.setEncoding('utf8')
+    request.on('data', (chunk) => {
+      raw += chunk
+    })
+    request.on('end', () => resolve(raw))
+    request.on('error', () => resolve(''))
+  })
+}
+
+function json(response, status, value) {
+  response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+  response.end(JSON.stringify(value))
+}
+
 export function apply(ctx) {
+  // ---------------------------------------------------------------- own approval card routes
+  // The browser half polls `pending` (which doubles as a heartbeat) and answers with `answer`.
+  try {
+    const web = typeof ctx.get === 'function' ? ctx.get('webServer') : undefined
+    if (web !== undefined && web !== null && typeof web.register === 'function') {
+      ctx.effect?.(
+        () =>
+          web.register({
+            kind: 'exact',
+            path: '/permission-plan/pending',
+            handler: (request, response) => {
+              lastClientPollAt = Date.now()
+              json(response, 200, { ok: true, pending: pendingList() })
+            }
+          }),
+        'permission-plan: pending'
+      )
+      ctx.effect?.(
+        () =>
+          web.register({
+            kind: 'exact',
+            path: '/permission-plan/answer',
+            handler: async (request, response) => {
+              lastClientPollAt = Date.now()
+              if (request.method !== 'POST') {
+                json(response, 405, { ok: false, error: 'POST only' })
+                return
+              }
+              let body
+              try {
+                body = JSON.parse(await readBody(request))
+              } catch {
+                json(response, 400, { ok: false, error: 'invalid json' })
+                return
+              }
+              const answered = answerPending(String(body?.id ?? ''), body?.allow === true)
+              json(response, answered ? 200 : 409, answered ? { ok: true } : { ok: false, error: 'unknown or expired approval' })
+            }
+          }),
+        'permission-plan: answer'
+      )
+    }
+  } catch {
+    // Without the web server the native approval flow still works.
+  }
+
   const current = () => {
     const store = loadStore()
     migrateLegacyModWords(store)
@@ -577,11 +683,24 @@ export function apply(ctx) {
         // A malformed request must never break the approval chain.
       }
 
+      // Ask with our own floating card when a browser half is listening: DSH's own card would
+      // take over the composer seat and hide the input box, ours floats above it instead.
       let outcome
-      try {
-        outcome = await next()
-      } catch {
-        return 'unavailable'
+      if (Date.now() - lastClientPollAt < CLIENT_FRESH_MS) {
+        outcome = await askWithOwnCard({
+          id: `pp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+          tool: String(req?.toolName ?? ''),
+          reason: String(req?.reason ?? '').slice(0, 600),
+          createdAt: Date.now()
+        })
+        if (outcome === 'timeout') outcome = undefined
+      }
+      if (outcome === undefined) {
+        try {
+          outcome = await next()
+        } catch {
+          return 'unavailable'
+        }
       }
 
       try {
@@ -702,7 +821,21 @@ export function apply(ctx) {
         // A single permission does not need a batch dialog: raise the host's own approval card
         // (the one with 允许一次 / 始终允许 / 拒绝) so the human sees one ordinary request.
         if (items.length <= 1 && clusters.length === 1) {
-          const outcome = await requestNativeApproval(ctx, agent, clusters[0], items[0] ?? task, detailLines)
+          // Prefer our own floating card; it leaves the composer alone. The native card is the
+          // fallback when no browser half is listening.
+          let outcome
+          if (Date.now() - lastClientPollAt < CLIENT_FRESH_MS) {
+            outcome = await askWithOwnCard({
+              id: `pp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+              tool: clusterLabel(clusters[0]),
+              reason: detailLines.join('\n').slice(0, 600),
+              createdAt: Date.now()
+            })
+            if (outcome === 'timeout') outcome = undefined
+          }
+          if (outcome === undefined) {
+            outcome = await requestNativeApproval(ctx, agent, clusters[0], items[0] ?? task, detailLines)
+          }
           if (outcome !== undefined) {
             const granted = outcome === 'allowed-once'
             if (granted) bump(current(), 'human')

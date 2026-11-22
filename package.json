@@ -1,6 +1,6 @@
 {
   "name": "dsh-permission-plan",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "One approval dialog for everything a task will need, then keyword memory instead of per-command prompts. Splits the batch pre-approval out of dsh-mod-build-auto-approve and merges it with generic keyword learning.",
   "type": "module",
   "main": "./index.mjs",
