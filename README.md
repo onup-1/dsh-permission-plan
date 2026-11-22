@@ -136,6 +136,7 @@ plugin_manager remove_bundle  target=dsh-permission-plan
 - **mod 插件不在时自动兜底**：如果 `dsh-mod-build-auto-approve` 被卸载或被 `plugin_manager` 禁用，委托自动失效，模组域请求改由本插件按 `mod` 区词表判断（否则你会退回逐条点批准）。检测方式是读 profile 的 `package.json`（`dsh.profile.bundles`）与 `cordis.patch.yml`（`- id: mod-build-auto-approve` 下的 `disabled` 标志），结果缓存 15 秒；`permission_check` 会打印「mod 插件检测：启用/未启用 · <profile 目录>」方便核对。
 - 想强制关掉兜底（无论 mod 插件是否在，都不接管模组域）：设环境变量 `DSH_PERMISSION_PLAN_MOD_FALLBACK=0`。
 - `配置` / `config` / `setup` / `设置` 是弱词：单条命中只提示、不自动放行，避免「一句配置」把模组环境配置顺手批了。
+- 文件搬运动词 `复制`/`copy`/`移动`/`move`/`写入`/`write`/`重命名`/`rename` 也是弱词，而且**永远不会被提升**（批准过一次计划也不提升）：这类词只说明动作、不说明落在哪，必须两条命中或配合一个强词才放行。
 
 ### 为什么要分成两套词表
 

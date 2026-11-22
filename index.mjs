@@ -56,7 +56,11 @@ const WEAK_KEYWORDS = new Set([
   // Generic enough that a single hit must not auto-approve: Minecraft mod work also
   // says "配置/config", and that domain belongs to dsh-mod-build-auto-approve.
   'config', 'configs', 'configure', 'setup',
-  '配置', '设置'
+  '配置', '设置',
+  // File-shuffling verbs are how ordinary work phrases itself, and "copy the file" says nothing
+  // about where it lands; two of them (or one plus another strong word) may pass, one may not.
+  'copy', 'move', 'write', 'rename',
+  '复制', '移动', '写入', '重命名'
 ])
 
 const MIN_WEAK_HITS = 2
@@ -167,6 +171,12 @@ const MOD_LEGACY_WORDS = new Set([
   '复验构建', '构件', 'userdev', 'jar', 'gradle', 'gradlew', 'forge', 'fabric', 'loom', 'mixin',
   'mcp', 'yarn', 'minecraft', 'mod', 'mods', 'modloader', 'runserver', 'runclient', '模组', '构建产物'
 ])
+/**
+ * Words that stay weak forever, even after a plan was approved: "copy" on its own never says
+ * where the file lands, so approving one plan must not turn it into a free pass.
+ */
+const NEVER_PROMOTE = new Set(['copy', 'move', 'write', 'rename', '复制', '移动', '写入', '重命名'])
+
 const MOD_SYNC_MS = 15000
 let modSyncState = { at: 0, file: '', mtimeMs: -1 }
 
@@ -250,7 +260,11 @@ function migrateLegacyModWords(store) {
     entry.zone = 'mod'
     moved += 1
   }
-  if (moved > 0) saveStore(store)
+  // File-shuffling verbs may have been promoted by an older build; they stay weak from now on.
+  const promoted = store.promoted.filter((word) => !NEVER_PROMOTE.has(String(word).toLowerCase()))
+  const demoted = store.promoted.length - promoted.length
+  if (demoted > 0) store.promoted = promoted
+  if (moved > 0 || demoted > 0) saveStore(store)
   return moved
 }
 
@@ -542,7 +556,7 @@ export function apply(ctx) {
           bump(live, 'human')
           saveStore(live)
           recordDecision({ at: Date.now(), tool: req?.toolName, mode: 'human', hits: words, added, reason: String(req?.reason ?? '').slice(0, 160) })
-          const weakNow = words.filter((word) => WEAK_KEYWORDS.has(word.toLowerCase()))
+          const weakNow = words.filter((word) => WEAK_KEYWORDS.has(word.toLowerCase()) && !NEVER_PROMOTE.has(word.toLowerCase()))
           if (weakNow.length > 0) {
             live.promoted = [...new Set([...live.promoted, ...weakNow])]
             saveStore(live)
@@ -696,6 +710,7 @@ export function apply(ctx) {
           learned.push(...words)
           for (const entry of store.keywords) {
             const lower = entry.word.toLowerCase()
+            if (NEVER_PROMOTE.has(lower)) continue
             if (WEAK_KEYWORDS.has(lower) && !store.promoted.some((word) => word.toLowerCase() === lower)) {
               store.promoted.push(entry.word)
             }
