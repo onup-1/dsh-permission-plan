@@ -229,17 +229,18 @@
       return
     }
     const first = pending[0]
-    const signature = first === undefined ? "" : `${first.id}:${first.tool}:${first.reason}`
+    if (first === undefined) {
+      lastPayload = ""
+      removeCard()
+      return
+    }
+    const signature = `${first.id}:${first.tool}:${first.reason}`
     if (signature === lastPayload) {
       const existing = document.getElementById(BOX_ID)
       if (existing !== null) place(existing)
       return
     }
     lastPayload = signature
-    if (signature === "") {
-      removeCard()
-      return
-    }
     render(first)
   }
 
