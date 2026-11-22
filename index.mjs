@@ -52,7 +52,11 @@ const STOPWORDS = new Set([
 const WEAK_KEYWORDS = new Set([
   'mod', 'java', 'jar', 'jvm', 'client', 'server', 'build', 'cache', 'mirror', 'source',
   'sources', 'wrapper', 'daemon', 'download', 'install', 'update',
-  '环境', '缓存', '下载', '依赖', '构建', '镜像', '预热', '安装', '更新'
+  '环境', '缓存', '下载', '依赖', '构建', '镜像', '预热', '安装', '更新',
+  // Generic enough that a single hit must not auto-approve: Minecraft mod work also
+  // says "配置/config", and that domain belongs to dsh-mod-build-auto-approve.
+  'config', 'configs', 'configure', 'setup',
+  '配置', '设置'
 ])
 
 const MIN_WEAK_HITS = 2
