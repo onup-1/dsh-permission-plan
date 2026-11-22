@@ -69,7 +69,7 @@ const BUILTIN_HIT = '(plan)'
 const MOD_DOMAIN_KEYWORD = /^(fabric|loom|forge|forgegradle|gradle|gradlew|maven|minecraft|mixin|yarn|mcp|mdk|jdk\d*|bmclapi|daynight|daynight-tuner|runserver|runclient|mods?|modloader|模组)$/i
 
 /** Broader detector for live requests: mod-flavoured text is judged by the mod plugin. */
-const MOD_DOMAIN_TEXT = /(fabric|loom|forge|gradle|minecraft|mixin|\bmcp\b|\byarn\b|daynight|bmclapi|runserver|runclient|模组)/i
+const MOD_DOMAIN_TEXT = /(fabric|loom|forge|gradle|minecraft|mixin|\bmcp\b|\byarn\b|\bmods?\b|daynight|bmclapi|runserver|runclient|模组)/i
 
 const MOD_PLUGIN_PACKAGE = 'dsh-mod-build-auto-approve'
 const MOD_PLUGIN_PATCH_ID = 'mod-build-auto-approve'
@@ -165,7 +165,7 @@ function modOwnerActive() {
  */
 const MOD_LEGACY_WORDS = new Set([
   '复验构建', '构件', 'userdev', 'jar', 'gradle', 'gradlew', 'forge', 'fabric', 'loom', 'mixin',
-  'mcp', 'yarn', 'minecraft', 'mod', 'mods', 'modloader', 'runserver', 'runclient', '模组'
+  'mcp', 'yarn', 'minecraft', 'mod', 'mods', 'modloader', 'runserver', 'runclient', '模组', '构建产物'
 ])
 const MOD_SYNC_MS = 15000
 let modSyncState = { at: 0, file: '', mtimeMs: -1 }
