@@ -75,6 +75,40 @@ const MOD_PLUGIN_PACKAGE = 'dsh-mod-build-auto-approve'
 const MOD_PLUGIN_PATCH_ID = 'mod-build-auto-approve'
 
 /**
+ * Zones are the framework's compartments: a request is classified into exactly one of
+ * them, and each zone keeps its own vocabulary. `other` is the catch-all and its words
+ * also apply inside the other zones (a generic word like `pwsh` is not domain specific).
+ */
+const GITHUB_ZONE_TEXT = /(github|git-ssl|\bgit\b|gist|\bgh\b|\bcli\b|commit|push|pull request|clone|merge|\bbranch\b|repo|raw\.githubusercontent|api\.github)/i
+const ZONES = [
+  { id: 'mod', label: 'Minecraft 模组', order: 0, pattern: MOD_DOMAIN_TEXT, delegate: MOD_PLUGIN_PACKAGE },
+  { id: 'github', label: 'GitHub / 版本库', order: 1, pattern: GITHUB_ZONE_TEXT, delegate: null },
+  { id: 'other', label: '其他', order: 2, pattern: null, delegate: null }
+]
+const ZONE_IDS = new Set(ZONES.map((zone) => zone.id))
+
+function zoneOf(text) {
+  const haystack = String(text ?? '')
+  for (const zone of ZONES) {
+    if (zone.pattern !== null && zone.pattern.test(haystack)) return zone.id
+  }
+  return 'other'
+}
+
+function zoneOfWord(word) {
+  return zoneOf(word)
+}
+
+function zoneMeta(id) {
+  return ZONES.find((zone) => zone.id === id) ?? ZONES[ZONES.length - 1]
+}
+
+/** Which zones' vocabularies may speak for a request in `zone`. */
+function zoneScope(zone) {
+  return zone === 'other' ? new Set(['other']) : new Set([zone, 'other'])
+}
+
+/**
  * Is the Minecraft mod approver actually running? When it is not (uninstalled or
  * disabled through plugin_manager), mod-flavoured requests fall back to this plugin
  * so the user is not left with per-command prompts.
@@ -128,7 +162,7 @@ function modOwnerActive() {
 const CLUSTERS = [
   { id: 'fs-write', label: '写入工作区之外的文件', re: /(\bwrite\b|\bsave\b|\bcopy\b|\bmove\b|\brename\b|\bmkdir\b|写入|写入到|保存|复制|移动|重命名|新建目录|覆盖)/i },
   { id: 'process', label: '启动/结束本地进程', re: /(\bstart\b|\bspawn\b|\bnpm\b|\bpnpm\b|\bpip\b|\bgradle\b|\bmvn\b|\bjava\b|\bnode\b|\bpython\b|\bcsc\b|启动|运行|执行|编译|构建)/i },
-  { id: 'network', label: '访问网络/下载依赖', re: /(\bdownload\b|\bwget\b|\bcurl\b|\bhttp\b|\bhttps\b|\bgit\s+clone\b|下载|拉取|镜像|接口)/i },
+  { id: 'network', label: '访问网络/下载依赖', re: /(\bdownload\b|\bwget\b|\bcurl\b|\bhttp\b|\bhttps\b|\bgit\s+(?:clone|push|pull|fetch|ls-remote|remote)\b|\bgit-ssl\b|\bgithub\b|\bgist\b|下载|拉取|推送|镜像|接口)/i },
   { id: 'install', label: '安装、升级软件包', re: /(\binstall\b|\bupgrade\b|\bunzip\b|\bextract\b|\bpackage\b|安装|升级|解压|依赖包)/i },
   { id: 'system', label: '修改系统级配置', re: /(\bhosts\b|\bregistry\b|\bservice\b|\bscheduled\s+task\b|\bschtasks\b|\bipconfig\b|注册表|服务|计划任务|系统配置|防火墙)/i },
   { id: 'elevate', label: '请求管理员权限', re: /(\badmin\b|\buac\b|\bsudo\b|\belevat|\brunas\b|管理员|提权|以管理员)/i },
@@ -137,7 +171,9 @@ const CLUSTERS = [
 
 function readJson(path, fallback) {
   try {
-    return JSON.parse(readFileSync(path, 'utf8'))
+    // A BOM sneaks in whenever a human edits these files with PowerShell 5.1's Set-Content,
+    // and JSON.parse refuses it, so strip it before parsing instead of silently losing the table.
+    return JSON.parse(readFileSync(path, 'utf8').replace(/^\uFEFF/, ''))
   } catch {
     return fallback
   }
@@ -164,6 +200,7 @@ function loadStore() {
       if (typeof entry.word !== 'string' || entry.word.trim() === '') continue
       store.keywords.push({
         word: entry.word.trim(),
+        zone: ZONE_IDS.has(entry.zone) ? entry.zone : zoneOfWord(entry.word.trim()),
         at: Number.isFinite(entry.at) ? entry.at : 0,
         uses: Number.isFinite(entry.uses) ? entry.uses : 0,
         source: typeof entry.source === 'string' ? entry.source : 'manual'
@@ -285,10 +322,12 @@ function extractKeywords(text) {
   return [...new Set(words)].slice(0, 24)
 }
 
-function matchedKeywords(text, store) {
+function matchedKeywords(text, store, zone = zoneOf(text)) {
   const haystack = String(text ?? '').toLowerCase()
+  const scope = zoneScope(zone)
   const hits = []
   for (const entry of store.keywords) {
+    if (!scope.has(entry.zone ?? 'other')) continue
     const word = entry.word.toLowerCase()
     const isCjk = /[\u4e00-\u9fff]/.test(word)
     const hit = isCjk ? haystack.includes(word) : new RegExp(`(^|[^a-z0-9_.])${word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z0-9_.]|$)`, 'i').test(haystack)
@@ -303,33 +342,34 @@ function matchedKeywords(text, store) {
 /** Decide whether a live approval request can be granted without asking. */
 function classify(req, store) {
   const text = reasonText(req)
+  const zone = zoneOf(text)
   const blocked = DANGER_PATTERN.test(text)
-  const modish = MOD_DOMAIN_TEXT.test(text)
-  const modOwned = modish && modOwnerActive()
-  const hits = matchedKeywords(text, store)
+  const delegated = zone === 'mod' && modOwnerActive()
+  const hits = matchedKeywords(text, store, zone)
   const strong = hits.filter((word) => !WEAK_KEYWORDS.has(word.toLowerCase()))
   const weak = hits.filter((word) => WEAK_KEYWORDS.has(word.toLowerCase()))
   const promoted = new Set(store.promoted.map((word) => word.toLowerCase()))
   const weakOk = weak.filter((word) => promoted.has(word.toLowerCase()) || !WEAK_KEYWORDS.has(word.toLowerCase()))
   const allowedTool = req?.toolName === undefined ? true : AUTO_TOOLS.has(String(req.toolName))
-  // Mod-flavoured requests belong to dsh-mod-build-auto-approve while it runs; once it is
-  // gone this plugin takes over instead of leaving the user to approve every command.
-  const auto = !blocked && !modOwned && allowedTool && (strong.length > 0 || weakOk.length >= MIN_WEAK_HITS || weak.length >= MIN_WEAK_HITS)
-  return { auto, blocked, modish, modOwned, hits, allowedTool, tool: req?.toolName }
+  // The mod zone is delegated to dsh-mod-build-auto-approve while it runs; once it is gone
+  // this plugin takes that zone over instead of leaving the user to approve every command.
+  const auto = !blocked && !delegated && allowedTool && (strong.length > 0 || weakOk.length >= MIN_WEAK_HITS || weak.length >= MIN_WEAK_HITS)
+  return { auto, blocked, zone, delegated, modish: zone === 'mod', modOwned: delegated, hits, allowedTool, tool: req?.toolName }
 }
 
-function remember(store, words, source) {
+function remember(store, words, source, zone = 'other') {
   const now = Date.now()
   const known = new Set(store.keywords.map((entry) => entry.word.toLowerCase()))
   let added = 0
   for (const raw of words) {
     const word = String(raw ?? '').trim()
     if (word.length < 2 || STOPWORDS.has(word.toLowerCase())) continue
-    // Minecraft mod work belongs to dsh-mod-build-auto-approve: never absorb its vocabulary here,
-    // otherwise a single mod word would let this plugin silently approve mod builds too.
-    if (MOD_DOMAIN_KEYWORD.test(word.toLowerCase())) continue
+    // Words naming the Minecraft mod domain are learned only while that zone is ours:
+    // otherwise one mod word would let this plugin approve mod builds behind the mod
+    // plugin's back.
+    if (zone !== 'mod' && MOD_DOMAIN_KEYWORD.test(word.toLowerCase())) continue
     if (known.has(word.toLowerCase())) continue
-    store.keywords.push({ word, at: now, uses: 0, source })
+    store.keywords.push({ word, zone: ZONE_IDS.has(zone) ? zone : zoneOfWord(word), at: now, uses: 0, source })
     known.add(word.toLowerCase())
     added += 1
   }
@@ -398,7 +438,7 @@ export function apply(ctx) {
         // Never learn from a destructive request: one approved deletion must not generalise.
         if (outcome === 'allowed-once' && req?.toolName !== 'plugin_manager' && !DANGER_PATTERN.test(reasonText(req))) {
           const words = extractKeywords(reasonText(req))
-          const added = remember(live, words, 'manual')
+          const added = remember(live, words, 'manual', zoneOf(reasonText(req)))
           bump(live, 'human')
           saveStore(live)
           recordDecision({ at: Date.now(), tool: req?.toolName, mode: 'human', hits: words, added, reason: String(req?.reason ?? '').slice(0, 160) })
@@ -537,8 +577,22 @@ export function apply(ctx) {
         const store = current()
         const learned = []
         if (approved) {
-          const words = extractKeywords(blob)
-          remember(store, words, 'plan')
+          // A plan can span zones (a mod build that also pushes to GitHub), so each item is
+          // filed under its own zone instead of dumping the whole plan into one vocabulary.
+          const perZone = new Map()
+          const collect = (text) => {
+            const value = String(text ?? '')
+            if (value.trim() === '') return
+            const zone = zoneOf(value)
+            perZone.set(zone, [...(perZone.get(zone) ?? []), ...extractKeywords(value)])
+          }
+          if (typeof args?.task === 'string') collect(args.task)
+          for (const item of items) collect(item)
+          const words = []
+          for (const [zone, bucket] of perZone) {
+            remember(store, bucket, 'plan', zone)
+            words.push(...bucket)
+          }
           learned.push(...words)
           for (const entry of store.keywords) {
             const lower = entry.word.toLowerCase()
@@ -604,24 +658,25 @@ export function apply(ctx) {
       async execute(args) {
         const text = typeof args?.text === 'string' ? args.text : ''
         const store = current()
+        const zone = zoneOf(text)
         const clusters = clustersOf(text)
-        const hits = matchedKeywords(text, store)
+        const hits = matchedKeywords(text, store, zone)
         const destructive = clusters.includes('destructive')
-        const modish = MOD_DOMAIN_TEXT.test(text)
-        const modOwned = modish && modOwnerActive()
+        const delegated = zone === 'mod' && modOwnerActive()
         const strong = hits.filter((word) => !WEAK_KEYWORDS.has(word.toLowerCase()))
-        const needsApproval = modOwned || destructive || (strong.length === 0 && hits.length < MIN_WEAK_HITS)
+        const needsApproval = delegated || destructive || (strong.length === 0 && hits.length < MIN_WEAK_HITS)
         const lines = [
+          `分区：${zoneMeta(zone).label}（${zone}）`,
           `权限类别：${clusters.length === 0 ? '（未识别）' : clusters.map(clusterLabel).join('、')}`,
           `已记住的关键词命中：${hits.length === 0 ? '（无）' : hits.join('、')}`,
-          modOwned ? '领域归属：Minecraft 模组（由 dsh-mod-build-auto-approve 放行，本插件不接管）。' : '',
-          modish && !modOwned ? '领域归属：Minecraft 模组（mod 插件当前未启用 → 本插件兜底判断）。' : '',
-          modish ? `mod 插件检测：${modOwnerActive() ? '启用' : '未启用'} · ${modOwnerState.source}` : '',
-          modOwned
-            ? '结论：模组域请求，交给 mod 插件判断。'
+          delegated ? '分区归属：mod 区已委托给 dsh-mod-build-auto-approve，本插件不接管。' : '',
+          zone === 'mod' && !delegated ? '分区归属：mod 区（mod 插件未启用 → 本插件接管该区）。' : '',
+          zone === 'mod' ? `mod 插件检测：${modOwnerActive() ? '启用' : '未启用'} · ${modOwnerState.source}` : '',
+          delegated
+            ? '结论：mod 区请求，交给 mod 插件判断。'
             : needsApproval
               ? '结论：这条需要人工审批，建议先调用 permission_plan。'
-              : '结论：已有记住的权限，可以自动放行。',
+              : '结论：本分区已有记住的权限，可以自动放行。',
           destructive ? '注意：包含删除/终止类操作，永远不会自动放行。' : ''
         ].filter((line) => line !== '')
         return { clusters, hits, needsApproval, destructive, text: lines.join('\n') }
@@ -671,11 +726,13 @@ export function apply(ctx) {
           return { count: 0, text: `已清空全部关键词（原有 ${count} 个），之后所有提权都会重新询问。` }
         }
         const ranked = [...store.keywords].sort((a, b) => b.uses - a.uses || b.at - a.at)
-        const lines = [`当前记住 ${store.keywords.length} 个关键词（上限 ${KEYWORD_CAP}）：`]
+        const perZone = ZONES.map((zone) => `${zone.label} ${store.keywords.filter((entry) => (entry.zone ?? 'other') === zone.id).length}`).join(' · ')
+        const lines = [`当前记住 ${store.keywords.length} 个关键词（上限 ${KEYWORD_CAP}）：${perZone}`]
         for (const entry of ranked.slice(0, 60)) {
           const when = entry.at > 0 ? new Date(entry.at).toISOString().slice(0, 10) : '—'
           const weak = WEAK_KEYWORDS.has(entry.word.toLowerCase()) ? '（弱词）' : ''
-          lines.push(`  ${entry.word.padEnd(24)} 命中 ${String(entry.uses).padStart(4)} 次 · ${entry.source} · ${when}${weak}`)
+          const zone = `[${entry.zone ?? 'other'}]`
+          lines.push(`  ${entry.word.padEnd(24)} ${zone.padEnd(9)} 命中 ${String(entry.uses).padStart(4)} 次 · ${entry.source} · ${when}${weak}`)
         }
         if (ranked.length === 0) lines.push('  （空）')
         return { count: store.keywords.length, text: lines.join('\n') }

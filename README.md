@@ -91,6 +91,26 @@ plugin_manager remove_bundle  target=dsh-permission-plan
 
 想看省了多少次点击：`permission_stats({ limit: 20 })`。
 
+## 分区（zones）
+
+这个插件是**权限总框架**：每个审批请求先被分到一个「区」，每个区的规则和词表各自独立，互不串味。
+
+| 区 | 识别依据 | 归属 |
+| --- | --- | --- |
+| `mod` Minecraft 模组 | `fabric` / `loom` / `forge` / `gradle` / `minecraft` / `mixin` / `yarn` / `daynight` / `runserver` / `模组` 等 | 装了 `dsh-mod-build-auto-approve` 就委托给它；没装则由本插件接管 |
+| `github` GitHub / 版本库 | `github` / `gist` / `git` / `git-ssl` / `commit` / `push` / `pull request` / `clone` / `branch` / `repo` / `api.github` 等 | 本插件自己管 |
+| `other` 其他 | 兜底 | 本插件自己管 |
+
+规则：
+
+- 词表按区分开存：`learned.json` 里每条是 `{ word, zone, at, uses, source }`。一个区记住的词，不会让另一个区自动放行。
+- `other` 区的词在三个区里都算命中（`pwsh` 这类通用词本来就跨区有效）；反过来 `mod` 区的词不会在 `github` 区生效。
+- 计划跨区也安全：`permission_plan` 会**逐条**判断每个操作项属于哪个区，分别记进各自词表（例如「构建模组 + push 到 GitHub」会同时写进 `mod` 和 `github`）。
+- 删除/终止类操作在任何区都不会自动放行；`plugin_manager` 同样永不自动放行。
+- 关掉 mod 兜底：设 `DSH_PERMISSION_PLAN_MOD_FALLBACK=0`。
+
+加一个新区只要三步：在 `ZONES` 里加一项（`id` / `label` / `pattern` / 可选 `delegate`），决定是否委托给别的插件，再在 README 这张表补一行——`classify()`、词表过滤、`permission_check` 输出、`permission_keywords` 统计都会自动带上它。
+
 ## 分工：本插件管通用任务，mod 相关交给 dsh-mod-build-auto-approve
 
 两个插件的**词表分开、职责分开**，不要合并：
