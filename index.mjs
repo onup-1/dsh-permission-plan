@@ -71,6 +71,59 @@ const MOD_DOMAIN_KEYWORD = /^(fabric|loom|forge|forgegradle|gradle|gradlew|maven
 /** Broader detector for live requests: mod-flavoured text is judged by the mod plugin. */
 const MOD_DOMAIN_TEXT = /(fabric|loom|forge|gradle|minecraft|mixin|\bmcp\b|\byarn\b|daynight|bmclapi|runserver|runclient|模组)/i
 
+const MOD_PLUGIN_PACKAGE = 'dsh-mod-build-auto-approve'
+const MOD_PLUGIN_PATCH_ID = 'mod-build-auto-approve'
+
+/**
+ * Is the Minecraft mod approver actually running? When it is not (uninstalled or
+ * disabled through plugin_manager), mod-flavoured requests fall back to this plugin
+ * so the user is not left with per-command prompts.
+ */
+let modOwnerState = { at: 0, active: true, source: 'unknown' }
+function modOwnerActive() {
+  if (process.env.DSH_PERMISSION_PLAN_MOD_FALLBACK === '0') {
+    modOwnerState = { at: Date.now(), active: true, source: 'fallback-off' }
+    return true
+  }
+  const now = Date.now()
+  if (now - modOwnerState.at < 15000) return modOwnerState.active
+  let active = true
+  let source = 'assumed'
+  for (const home of [process.env.DSH_HOME, join(process.env.USERPROFILE || process.cwd(), '.dsh'), join(process.env.APPDATA || process.cwd(), 'dsh')]) {
+    if (!home) continue
+    try {
+      const dir = join(home, 'profiles', process.env.DSH_PROFILE || 'desktop')
+      const manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'))
+      const bundles = manifest?.dsh?.profile?.bundles
+      if (!Array.isArray(bundles)) continue
+      source = dir
+      active = bundles.includes(MOD_PLUGIN_PACKAGE)
+      if (active) {
+        try {
+          const lines = readFileSync(join(dir, 'cordis.patch.yml'), 'utf8').split(/\r?\n/)
+          for (let index = 0; index < lines.length; index += 1) {
+            if (!new RegExp(`^-\\s*id:\\s*${MOD_PLUGIN_PATCH_ID}\\s*$`).test(lines[index])) continue
+            for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
+              if (/^-\s/.test(lines[cursor])) break
+              if (/^\s*disabled:\s*true\s*$/.test(lines[cursor])) active = false
+            }
+            break
+          }
+        } catch (error) {
+          source = `${dir} (patch unreadable: ${String(error?.code ?? error)})`
+        }
+      } else {
+        source = `${dir} (not in bundles)`
+      }
+      break
+    } catch {
+      continue
+    }
+  }
+  modOwnerState = { at: now, active, source }
+  return active
+}
+
 /** Cluster rules: label, matcher and the words worth remembering when the cluster is approved. */
 const CLUSTERS = [
   { id: 'fs-write', label: '写入工作区之外的文件', re: /(\bwrite\b|\bsave\b|\bcopy\b|\bmove\b|\brename\b|\bmkdir\b|写入|写入到|保存|复制|移动|重命名|新建目录|覆盖)/i },
@@ -252,16 +305,17 @@ function classify(req, store) {
   const text = reasonText(req)
   const blocked = DANGER_PATTERN.test(text)
   const modish = MOD_DOMAIN_TEXT.test(text)
+  const modOwned = modish && modOwnerActive()
   const hits = matchedKeywords(text, store)
   const strong = hits.filter((word) => !WEAK_KEYWORDS.has(word.toLowerCase()))
   const weak = hits.filter((word) => WEAK_KEYWORDS.has(word.toLowerCase()))
   const promoted = new Set(store.promoted.map((word) => word.toLowerCase()))
   const weakOk = weak.filter((word) => promoted.has(word.toLowerCase()) || !WEAK_KEYWORDS.has(word.toLowerCase()))
   const allowedTool = req?.toolName === undefined ? true : AUTO_TOOLS.has(String(req.toolName))
-  // Mod-flavoured requests are left to dsh-mod-build-auto-approve, even when a generic
-  // keyword of ours happens to match.
-  const auto = !blocked && !modish && allowedTool && (strong.length > 0 || weakOk.length >= MIN_WEAK_HITS || weak.length >= MIN_WEAK_HITS)
-  return { auto, blocked, modish, hits, allowedTool, tool: req?.toolName }
+  // Mod-flavoured requests belong to dsh-mod-build-auto-approve while it runs; once it is
+  // gone this plugin takes over instead of leaving the user to approve every command.
+  const auto = !blocked && !modOwned && allowedTool && (strong.length > 0 || weakOk.length >= MIN_WEAK_HITS || weak.length >= MIN_WEAK_HITS)
+  return { auto, blocked, modish, modOwned, hits, allowedTool, tool: req?.toolName }
 }
 
 function remember(store, words, source) {
@@ -554,13 +608,16 @@ export function apply(ctx) {
         const hits = matchedKeywords(text, store)
         const destructive = clusters.includes('destructive')
         const modish = MOD_DOMAIN_TEXT.test(text)
+        const modOwned = modish && modOwnerActive()
         const strong = hits.filter((word) => !WEAK_KEYWORDS.has(word.toLowerCase()))
-        const needsApproval = modish || destructive || (strong.length === 0 && hits.length < MIN_WEAK_HITS)
+        const needsApproval = modOwned || destructive || (strong.length === 0 && hits.length < MIN_WEAK_HITS)
         const lines = [
           `权限类别：${clusters.length === 0 ? '（未识别）' : clusters.map(clusterLabel).join('、')}`,
           `已记住的关键词命中：${hits.length === 0 ? '（无）' : hits.join('、')}`,
-          modish ? '领域归属：Minecraft 模组（由 dsh-mod-build-auto-approve 放行，本插件不接管）。' : '',
-          modish
+          modOwned ? '领域归属：Minecraft 模组（由 dsh-mod-build-auto-approve 放行，本插件不接管）。' : '',
+          modish && !modOwned ? '领域归属：Minecraft 模组（mod 插件当前未启用 → 本插件兜底判断）。' : '',
+          modish ? `mod 插件检测：${modOwnerActive() ? '启用' : '未启用'} · ${modOwnerState.source}` : '',
+          modOwned
             ? '结论：模组域请求，交给 mod 插件判断。'
             : needsApproval
               ? '结论：这条需要人工审批，建议先调用 permission_plan。'
