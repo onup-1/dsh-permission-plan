@@ -108,7 +108,8 @@ plugin_manager remove_bundle  target=dsh-permission-plan
 
 - 同一个 `approval/request` 会先过两道钩子：谁先命中自己的词表谁就返回 `allowed-once`，另一个继续 `next()`，最后才轮到人工审批。
 - **不会弹两次窗**：命中即返回，没命中的那个根本不会问人。
-- 唯一的交叉情况：你为了通用任务批准过 `pwsh`、`配置` 这类泛词，模组构建如果正好只含这些泛词，可能被本插件先放行——放行的仍是「你自己批过的同一类命令」，且删除/终止类在两边都永不放行。
+- **硬边界（代码保证）**：理由里出现 `fabric|loom|forge|gradle|minecraft|mixin|mcp|yarn|daynight|bmclapi|runserver|runclient|模组` 之一的请求，本插件**一律不自动放行**，交给 mod 插件判断；这些词也不会被本插件学进词表。
+- `配置` / `config` / `setup` / `设置` 是弱词：单条命中只提示、不自动放行，避免「一句配置」把模组环境配置顺手批了。
 
 ### 想把边界划得更死？
 

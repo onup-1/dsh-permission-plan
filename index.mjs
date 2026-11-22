@@ -62,6 +62,15 @@ const WEAK_KEYWORDS = new Set([
 const MIN_WEAK_HITS = 2
 const BUILTIN_HIT = '(plan)'
 
+/**
+ * Vocabulary that belongs to the Minecraft mod domain (`dsh-mod-build-auto-approve`).
+ * Kept out of this plugin's word list so the two stores never blur together.
+ */
+const MOD_DOMAIN_KEYWORD = /^(fabric|loom|forge|forgegradle|gradle|gradlew|maven|minecraft|mixin|yarn|mcp|mdk|jdk\d*|bmclapi|daynight|daynight-tuner|runserver|runclient|mods?|modloader|模组)$/i
+
+/** Broader detector for live requests: mod-flavoured text is judged by the mod plugin. */
+const MOD_DOMAIN_TEXT = /(fabric|loom|forge|gradle|minecraft|mixin|\bmcp\b|\byarn\b|daynight|bmclapi|runserver|runclient|模组)/i
+
 /** Cluster rules: label, matcher and the words worth remembering when the cluster is approved. */
 const CLUSTERS = [
   { id: 'fs-write', label: '写入工作区之外的文件', re: /(\bwrite\b|\bsave\b|\bcopy\b|\bmove\b|\brename\b|\bmkdir\b|写入|写入到|保存|复制|移动|重命名|新建目录|覆盖)/i },
@@ -242,14 +251,17 @@ function matchedKeywords(text, store) {
 function classify(req, store) {
   const text = reasonText(req)
   const blocked = DANGER_PATTERN.test(text)
+  const modish = MOD_DOMAIN_TEXT.test(text)
   const hits = matchedKeywords(text, store)
   const strong = hits.filter((word) => !WEAK_KEYWORDS.has(word.toLowerCase()))
   const weak = hits.filter((word) => WEAK_KEYWORDS.has(word.toLowerCase()))
   const promoted = new Set(store.promoted.map((word) => word.toLowerCase()))
   const weakOk = weak.filter((word) => promoted.has(word.toLowerCase()) || !WEAK_KEYWORDS.has(word.toLowerCase()))
   const allowedTool = req?.toolName === undefined ? true : AUTO_TOOLS.has(String(req.toolName))
-  const auto = !blocked && allowedTool && (strong.length > 0 || weakOk.length >= MIN_WEAK_HITS || weak.length >= MIN_WEAK_HITS)
-  return { auto, blocked, hits, allowedTool, tool: req?.toolName }
+  // Mod-flavoured requests are left to dsh-mod-build-auto-approve, even when a generic
+  // keyword of ours happens to match.
+  const auto = !blocked && !modish && allowedTool && (strong.length > 0 || weakOk.length >= MIN_WEAK_HITS || weak.length >= MIN_WEAK_HITS)
+  return { auto, blocked, modish, hits, allowedTool, tool: req?.toolName }
 }
 
 function remember(store, words, source) {
@@ -259,6 +271,9 @@ function remember(store, words, source) {
   for (const raw of words) {
     const word = String(raw ?? '').trim()
     if (word.length < 2 || STOPWORDS.has(word.toLowerCase())) continue
+    // Minecraft mod work belongs to dsh-mod-build-auto-approve: never absorb its vocabulary here,
+    // otherwise a single mod word would let this plugin silently approve mod builds too.
+    if (MOD_DOMAIN_KEYWORD.test(word.toLowerCase())) continue
     if (known.has(word.toLowerCase())) continue
     store.keywords.push({ word, at: now, uses: 0, source })
     known.add(word.toLowerCase())
@@ -538,12 +553,18 @@ export function apply(ctx) {
         const clusters = clustersOf(text)
         const hits = matchedKeywords(text, store)
         const destructive = clusters.includes('destructive')
+        const modish = MOD_DOMAIN_TEXT.test(text)
         const strong = hits.filter((word) => !WEAK_KEYWORDS.has(word.toLowerCase()))
-        const needsApproval = destructive || (strong.length === 0 && hits.length < MIN_WEAK_HITS)
+        const needsApproval = modish || destructive || (strong.length === 0 && hits.length < MIN_WEAK_HITS)
         const lines = [
           `权限类别：${clusters.length === 0 ? '（未识别）' : clusters.map(clusterLabel).join('、')}`,
           `已记住的关键词命中：${hits.length === 0 ? '（无）' : hits.join('、')}`,
-          needsApproval ? '结论：这条需要人工审批，建议先调用 permission_plan。' : '结论：已有记住的权限，可以自动放行。',
+          modish ? '领域归属：Minecraft 模组（由 dsh-mod-build-auto-approve 放行，本插件不接管）。' : '',
+          modish
+            ? '结论：模组域请求，交给 mod 插件判断。'
+            : needsApproval
+              ? '结论：这条需要人工审批，建议先调用 permission_plan。'
+              : '结论：已有记住的权限，可以自动放行。',
           destructive ? '注意：包含删除/终止类操作，永远不会自动放行。' : ''
         ].filter((line) => line !== '')
         return { clusters, hits, needsApproval, destructive, text: lines.join('\n') }
