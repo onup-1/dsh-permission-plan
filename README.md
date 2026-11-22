@@ -91,13 +91,28 @@ plugin_manager remove_bundle  target=dsh-permission-plan
 
 想看省了多少次点击：`permission_stats({ limit: 20 })`。
 
-## 和 dsh-mod-build-auto-approve 的关系
+## 分工：本插件管通用任务，mod 相关交给 dsh-mod-build-auto-approve
 
-那个插件管 Minecraft 模组构建场景（内置 fabric/gradle 正则 + 提示音 + 模组关键词表），功能上包含本插件的两部分。本插件是**通用版**：不绑定任何领域，类别靠规则识别，关键词表独立。
+两个插件的**词表分开、职责分开**，不要合并：
 
-两者可以同时装：同一个请求会被两套词表各自判断，谁命中谁放行，结论一致；两边的 `learned.json` / `stats.jsonl` 完全独立，互不读写。若只想留一套词表，禁用一个即可。
+| | dsh-mod-build-auto-approve | dsh-permission-plan（本插件） |
+| --- | --- | --- |
+| 领域 | Minecraft 模组构建：配环境、下 JDK、Gradle/Loom/Forge、编译产 mod、调 MC 启动与窗口位置 | 其余一切：读写文件、起进程、下载依赖、装包、改系统配置、跑测试 |
+| 放行依据 | 领域正则 `fabric\|loom\|forge\|gradle\|daynight\|minecraft\|模组\|1.x.y` + 领域词表（forge/fabric/loom/gradle/maven/mcp/yarn/mixin…） | 无领域正则；靠权限簇识别 + 你批准过的通用关键词 |
+| 词表文件 | `C:\Users\rog\Documents\deepseek-harness\default-workspace\dsh-mod-approve\learned.json` | `C:\Users\rog\Documents\deepseek-harness\default-workspace\plugins\dsh-permission-plan\learned.json` |
+| 批量申请工具 | `mod_permission_plan`（模组场景专用文案） | `permission_plan`（通用） |
 
-注意：两边都会对同一个审批请求做判断，**不会**因此多弹一次窗——先命中的那个直接返回放行，没命中的继续往下走。
+两者互不读写对方的 `learned.json`，删掉任一个都不影响另一个。
+
+### 同时启用时的行为
+
+- 同一个 `approval/request` 会先过两道钩子：谁先命中自己的词表谁就返回 `allowed-once`，另一个继续 `next()`，最后才轮到人工审批。
+- **不会弹两次窗**：命中即返回，没命中的那个根本不会问人。
+- 唯一的交叉情况：你为了通用任务批准过 `pwsh`、`配置` 这类泛词，模组构建如果正好只含这些泛词，可能被本插件先放行——放行的仍是「你自己批过的同一类命令」，且删除/终止类在两边都永不放行。
+
+### 想把边界划得更死？
+
+在模组构建的会话里，让模型先用 `mod_permission_plan` 批一次（模组词表命中），之后模组命令走旧插件；通用任务用 `permission_plan`。两套词表各记各的，长期会自然分岔。
 
 ## License
 
