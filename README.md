@@ -110,6 +110,14 @@ const CARD_SOUND = 'cost-default.wav'
 
 ## 安装
 
+从 npm 装（推荐，当前 `0.2.2`）：
+
+```
+plugin_manager install_bundle  target=dsh-permission-plan
+```
+
+从本地目录装（改代码时用这个，profile 里会是 junction）：
+
 ```
 plugin_manager install_bundle  target=<本目录绝对路径>
 ```

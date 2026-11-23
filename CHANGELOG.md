@@ -3,6 +3,21 @@
 版本号跟随 `package.json`。日期为发布日期（本地时区 Asia/Shanghai）。
 每个版本后面的 hash 是 GitHub 上 `onup-1/dsh-permission-plan` 对应的提交。
 
+## 0.2.2 — 2026-11-23
+
+这次是「冷启动别掉线」的健壮性修复，功能与 0.2.1 一致。
+
+**修复**
+
+- **重启后插件不生效**：DSH 桌面应用重启时，`webServer` / `tools` / `userQuestions` / `approval` 可能还没激活，`ctx.get(name)` 只返回「已经 active」的 provider，于是 `apply()` 里拿到 `undefined`，路由没注册、四个工具全消失（现象是 `permission_stats` 报 `unknown tool`、`/permission-plan/pending` 与 `/permission-plan/sounds` 一律 404，而同机别的插件路由正常）。
+  - 新增 `serviceOf(ctx, name)`：先 `ctx.get(name)`，再退回属性读取 `ctx[name]`（属性读取走 Cordis 的 `inject` 声明，能拿到尚未 ready 的实例）。
+  - `apply()` 里若 `webServer` 还没就绪，路由注册先入队，再 `ctx.inject(['webServer'], install)` 挂到子 fiber 上补装（`child.effect(() => server.register(options))`），不再静默丢路由。
+  - 新增 `export const inject = ['tools']`：Cordis 会等工具注册表激活后才 apply 本插件，`ctx.get('tools')` 不会再是 `undefined`。`webServer` 仍保持可选（无头会话没有 web server）。
+
+**变更**
+
+- 浏览器 bundle 文件名保持 `client-0.2.1.js` 不变（只是产物名，内容未改）。
+
 ## 0.2.1 — 2026-11-22 · `d5de1d70`
 
 这次是「界面与提示音」的一次收口。

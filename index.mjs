@@ -280,12 +280,34 @@ const APPROVAL_TOOL_BY_CLUSTER = {
 }
 
 /**
+ * Resolve a host service both ways: `ctx.get(name)` returns only providers whose fiber is already
+ * active (0.2.2), while a plain property read needs a declared `inject`. Reading both lets the
+ * plugin work no matter which of the two the apply-time context happens to expose.
+ */
+function serviceOf(ctx, name) {
+  try {
+    if (typeof ctx?.get === 'function') {
+      const live = ctx.get(name)
+      if (live !== undefined && live !== null) return live
+    }
+  } catch {
+    // Fall through to the property read.
+  }
+  try {
+    const own = ctx?.[name]
+    return own === null ? undefined : own
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * Raise the host's own approval card for one permission instead of a batch dialog.
  * Returns undefined when the host has no approval service, so the caller can fall back.
  */
 async function requestNativeApproval(ctx, agent, cluster, item, detailLines) {
   if (agent === undefined) return undefined
-  const approval = typeof ctx.get === 'function' ? ctx.get('approval') : undefined
+  const approval = serviceOf(ctx, 'approval')
   if (approval === undefined || typeof approval.request !== 'function') return undefined
   const reason = [item, ...detailLines].filter((line) => typeof line === 'string' && line !== '').join('\n')
   try {
@@ -732,8 +754,19 @@ function sendSound(response, name) {
 export function apply(ctx) {
   // ---------------------------------------------------------------- own approval card routes
   // The browser half polls `pending` (which doubles as a heartbeat) and answers with `answer`.
+  // `webServer` may still be starting when this plugin applies, and `ctx.get()` only returns
+  // already-active providers, so a missing server is queued and installed by a child fiber below.
+  const pendingRegistrations = []
   try {
-    const web = typeof ctx.get === 'function' ? ctx.get('webServer') : undefined
+    let web = serviceOf(ctx, 'webServer')
+    if (web === undefined || web === null || typeof web.register !== 'function') {
+      web = {
+        register: (options) => {
+          pendingRegistrations.push({ options, label: options?.path ?? 'permission-plan route' })
+          return () => {}
+        }
+      }
+    }
     if (web !== undefined && web !== null && typeof web.register === 'function') {
       ctx.effect?.(
         () =>
@@ -925,6 +958,19 @@ setTimeout(() => {
   } catch {
     // Without the web server the native approval flow still works.
   }
+  if (pendingRegistrations.length > 0) {
+    // Snapshot before handing the table to a child fiber: that fiber may start after this call.
+    const queued = pendingRegistrations.splice(0)
+    const install = (child) => {
+      const server = serviceOf(child, 'webServer')
+      if (server === undefined || server === null || typeof server.register !== 'function') return
+      for (const { options, label } of queued) {
+        child.effect(() => server.register(options), `permission-plan: ${label}`)
+      }
+    }
+    if (typeof ctx.inject === 'function') ctx.inject(['webServer'], install)
+    else install(ctx)
+  }
 
   const current = () => {
     const store = loadStore()
@@ -1003,13 +1049,7 @@ setTimeout(() => {
   )
 
   // ---------------------------------------------------------------- tools
-  const tools = (() => {
-    try {
-      return typeof ctx.get === 'function' ? ctx.get('tools') : ctx.tools
-    } catch {
-      return undefined
-    }
-  })()
+  const tools = serviceOf(ctx, 'tools')
   if (tools === undefined || tools === null || typeof tools.register !== 'function') return
 
   const disposers = []
@@ -1128,7 +1168,7 @@ setTimeout(() => {
 
         let approved = false
         try {
-          const questions = typeof ctx.get === 'function' ? ctx.get('userQuestions') : undefined
+          const questions = serviceOf(ctx, 'userQuestions')
           if (questions !== undefined && typeof questions.ask === 'function') {
             const answer = await questions.ask({
               ...(agent === undefined ? {} : { agent }),
@@ -1392,5 +1432,10 @@ setTimeout(() => {
 }
 
 export const name = 'dsh-permission-plan'
+
+// Declaring the dependency makes Cordis apply this plugin only once the tool registry is active,
+// so `ctx.get('tools')`/`ctx.tools` can no longer come back undefined on a cold boot. `webServer`
+// stays optional on purpose (headless sessions have none) and is handled inside `apply`.
+export const inject = ['tools']
 
 export { classify, extractKeywords, clustersOf, matchedKeywords, CLUSTERS, WEAK_KEYWORDS, DANGER_PATTERN }
